@@ -1,0 +1,480 @@
+#!/usr/bin/env bash
+# Behavior tests for bin/fm-workstream-board.sh: fail-closed payload validation,
+# slot-injection round-trip through the built page, bind-before-arm through the
+# shared board lib, and idempotent re-arm of the stable board source.
+set -u
+
+# shellcheck source=tests/lib.sh
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+BOARD="$ROOT/bin/fm-workstream-board.sh"
+SNAPSHOT="$ROOT/bin/fm-workstream-snapshot.sh"
+TMP_ROOT=$(fm_test_tmproot fm-workstream-board)
+
+command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
+
+make_home() {  # <name>
+  local home="$TMP_ROOT/$1" fakebin
+  mkdir -p "$home/state" "$home/data"
+  fakebin=$(fm_fakebin "$home")
+  fm_fake_exit0 "$fakebin" lavish-axi
+  printf '%s\n' "$home"
+}
+
+run_board() {  # <home> <args...>
+  local home=$1
+  shift
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROCEVENT_CLAIM_ROOT="$home/procevent-claims" \
+    "$BOARD" "$@"
+}
+
+run_procevent() {  # <home> <command args...>
+  local home=$1
+  shift
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROCEVENT_CLAIM_ROOT="$home/procevent-claims" \
+    "$ROOT/bin/fm-procevent.sh" "$@"
+}
+
+run_decisions() {  # <home> <command args...>
+  local home=$1
+  shift
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    "$ROOT/bin/fm-decision-hold.sh" "$@"
+}
+
+run_lavish_source_id() {  # <home> <artifact>
+  local home=$1
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROCEVENT_CLAIM_ROOT="$home/procevent-claims" \
+    "$ROOT/bin/fm-procevent-lavish.sh" source-id "$2"
+}
+
+# A realistic payload: a held task with an agent chip, a done->queued edge, a
+# waiting item keyed by a captain-held task id with a release close mode, a
+# divergence row, and a string that tries to terminate the data block early.
+write_valid_payload() {  # <path>
+  cat > "$1" <<'EOF'
+{
+  "schema": "fm-workstream-board.v1",
+  "home": "test-home",
+  "generated": "2026-09-01T00:00Z",
+  "workstreams": [
+    {
+      "id": "quote-flow",
+      "name": "Quote Flow",
+      "outcome": "A quote flow that never silently drops a part: </script><b>x</b>",
+      "tasks": [
+        { "id": "quote-flow-fixes", "title": "G9 loud failure and friends", "state": "held",
+          "doing": "Finishing fix round 16", "contract": "no-mistakes, yolo off",
+          "agent": "claude · working (held)", "agent_tone": "working" },
+        { "id": "g6-define", "title": "Define G6 empty promises", "state": "done" },
+        { "id": "build-g6", "title": "Build the G6 fix", "state": "queued",
+          "pr_url": "https://github.com/example/repo/pull/1" }
+      ],
+      "counts": { "done": 1, "review": 0, "active": 0, "held": 1, "decision": 0, "queued": 3 },
+      "more_tasks": 2
+    }
+  ],
+  "edges": [ { "from": "g6-define", "to": "build-g6" } ],
+  "waiting": [
+    { "key": "wave5-ontology", "title": "Eval baseline spend for Wave 5",
+      "question": "Full baseline or returns-only?",
+      "options": [
+        { "value": "full", "label": "Full 3-run baseline" },
+        { "value": "returns-only", "label": "Returns group only", "hint": "agent recommends" }
+      ],
+      "recommend_value": "returns-only", "allow_freeform": true, "close": "release" }
+  ],
+  "agents": [ { "id": "quote-flow-fixes", "tone": "working", "doing": "fix round 16" } ],
+  "divergence": [ { "id": "analytics-triage", "note": "backlog queued, live PR open" } ]
+}
+EOF
+}
+
+# Extract the injected payload back out of a built board page.
+extract_payload() {  # <board-path>
+  sed -n '/<script id="workstream-data" type="application\/json">/,/<\/script>/p' "$1" \
+    | sed '1d;$d'
+}
+
+test_path_is_stable_home_scoped_and_mockup_safe() {
+  local home
+  home=$(make_home path)
+  [ "$(run_board "$home" path)" = "$home/.lavish/workstreams.html" ] \
+    || fail "the board path is not the stable home-scoped location"
+  case "$(run_board "$home" path)" in
+    */workstream-board.html) fail "the board path collides with the mockup artifact name" ;;
+  esac
+  pass "path prints the stable home-scoped board location clear of the mockup"
+}
+
+test_an_uncapped_lane_may_omit_its_counts() {
+  local home data
+  home=$(make_home uncapped)
+  data="$home/payload.json"
+  write_valid_payload "$data"
+  jq 'del(.workstreams[0].counts, .workstreams[0].more_tasks)' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  run_board "$home" build "$data" >/dev/null 2>&1 \
+    || fail "an uncapped lane without lane counts was refused"
+  [ -f "$home/.lavish/workstreams.html" ] || fail "the accepted payload produced no board"
+  pass "a lane that ships all of its rows may omit its lane counts"
+}
+
+# The board's one lane-total invariant: the six counts sum to EXACTLY the rows
+# the lane ships plus its more_tasks. Sweep both sides of that equation rather
+# than pinning one example payload, so a later hole cannot open unnoticed.
+test_lane_counts_must_total_the_whole_lane_exactly() {
+  local home data delta rc out
+  home=$(make_home lanetotal)
+  data="$home/payload.json"
+
+  # write_valid_payload ships 3 rows, more_tasks 2, and counts totalling 5.
+  for delta in -3 -2 -1 1 2 3; do
+    write_valid_payload "$data"
+    jq --argjson d "$delta" '.workstreams[0].counts.queued += $d' \
+      "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+    set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+    [ "$rc" -ne 0 ] \
+      || fail "lane counts off the lane total by $delta were accepted: $out"
+  done
+
+  # Same equation from the other side: move the lane total, keep counts fixed.
+  for delta in -2 -1 1 2 3; do
+    write_valid_payload "$data"
+    jq --argjson d "$delta" '.workstreams[0].more_tasks += $d' \
+      "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+    set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+    [ "$rc" -ne 0 ] \
+      || fail "a lane total moved $delta away from its counts was accepted: $out"
+  done
+
+  [ ! -e "$home/.lavish/workstreams.html" ] \
+    || fail "a refused lane-total payload still produced a board"
+
+  # The balanced payload the sweep perturbs must itself build, so the sweep is
+  # proving the invariant rather than refusing everything.
+  write_valid_payload "$data"
+  run_board "$home" build "$data" >/dev/null 2>&1 \
+    || fail "the balanced lane-total payload was refused"
+  [ -f "$home/.lavish/workstreams.html" ] || fail "the balanced payload produced no board"
+  pass "lane counts are refused unless they total the shipped rows plus more_tasks"
+}
+
+# The documented compose path end to end: run the real composer, apply only the
+# mechanical joins SKILL.md step 2 names, and hand the result to the real
+# builder. The composer emits `pr_url: null` on every task with no PR, so the
+# shapes it actually produces have to validate.
+compose_from_snapshot() {  # <home> <fakebin> <out.json>
+  local home=$1 fb=$2 out=$3 snapshot
+  snapshot=$(NET_LOG="$home/net.log" PATH="$fb:$PATH" FM_HOME="$home" \
+    FM_ROOT_OVERRIDE="$TMP_ROOT/fixture-root" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    "$SNAPSHOT" --json) || return 1
+  printf '%s' "$snapshot" | jq '
+    . as $root
+    | {
+        schema: "fm-workstream-board.v1",
+        home: $root.home,
+        generated: $root.generated,
+        workstreams: [ $root.workstreams[] as $w
+          | { id: $w.id, name: $w.name, outcome: $w.outcome,
+              tasks: [ $root.tasks[] | select(.ws == $w.id) ],
+              counts: { done: $w.done, review: $w.review, active: $w.active,
+                        held: $w.held, decision: $w.decision, queued: $w.queued },
+              more_tasks: $w.more } ],
+        edges: [ $root.edges[] | {from, to} ],
+        waiting: [ $root.decisions[]
+          | { key: .id, title: .summary, allow_freeform: true, options: [],
+              close: "release" } ],
+        agents: [ $root.agents[]
+          | { id: .id, doing: .doing,
+              tone: (if .state == "working" then "working"
+                     elif .state == "decision" then "decision"
+                     else "paused" end) } ],
+        divergence: [ $root.divergence[] | {id, note} ]
+      }' > "$out"
+}
+
+test_the_composers_own_output_shape_builds() {
+  local home fb data
+  home=$(make_home composed)
+  mkdir -p "$home/projects" "$home/config" "$TMP_ROOT/fixture-root"
+  fb="$home/fakebin"
+  cat > "$fb/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  display-message) printf '%%1\n' ;;
+  capture-pane) printf 'all quiet\n> \n' ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/tmux"
+  # A PR-less task, a task with a PR, a captain hold, and an ungrouped row, so
+  # both the null and the populated pr_url branches ship in one payload.
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+- [ ] quote - Quote Flow (kind: program)
+  Intended outcome: a quote flow that never silently drops a part.
+- [ ] quote-fixes - G9 loud failure and friends
+
+## Queued
+
+- [ ] quote-review - Analytics triage weekly study
+- [ ] spend-call - Eval spend decision (hold: full baseline or returns-only?, hold-kind: captain)
+- [ ] loner - Completely ungrouped work with no PR anywhere
+
+## Done
+EOF
+  fm_write_meta "$home/state/quote-fixes.meta" "backend=tmux" "window=fm:1" \
+    "kind=ship" "project=$home/projects/sample"
+  printf 'working: fixing G20\n' > "$home/state/quote-fixes.status"
+  fm_write_meta "$home/state/quote-review.meta" "backend=tmux" "window=fm:2" \
+    "kind=ship" "project=$home/projects/sample" "pr=https://github.com/acme/repo/pull/197"
+
+  data="$home/payload.json"
+  compose_from_snapshot "$home" "$fb" "$data" || fail "the composer did not run"
+
+  # The payload really does carry the shape under test, in both branches.
+  jq -e '
+    ([.workstreams[].tasks[] | select(.pr_url == null)] | length) > 0
+      and ([.workstreams[].tasks[] | select(.pr_url != null)] | length) > 0
+  ' "$data" >/dev/null || fail "the composed payload has no null pr_url to prove: $(cat "$data")"
+
+  run_board "$home" build "$data" >/dev/null 2>&1 \
+    || fail "the composer's own output was refused by the builder: $(cat "$data")"
+  [ -f "$home/.lavish/workstreams.html" ] || fail "the composed payload produced no board"
+  pass "the composer's own output shape builds through the real builder"
+}
+
+test_build_refuses_malformed_payloads_before_touching_the_board() {
+  local home data board rc out
+  home=$(make_home refusal)
+  board="$home/.lavish/workstreams.html"
+  data="$home/payload.json"
+
+  printf 'not json\n' > "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a non-JSON payload was accepted"
+  assert_contains "$out" "not valid JSON" "the non-JSON refusal did not say why: $out"
+
+  printf '{"schema":"fm-workstream-board.v2"}\n' > "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a wrong-schema payload was accepted"
+  assert_contains "$out" "fm-workstream-board.v1" "the schema refusal did not name the contract: $out"
+
+  write_valid_payload "$data"
+  jq '.workstreams[0].tasks[0].state = "sailing"' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "an unknown task state was accepted"
+
+  write_valid_payload "$data"
+  jq '.workstreams[0].tasks[0].agent_tone = "loud"' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "an unknown agent tone was accepted"
+
+  write_valid_payload "$data"
+  jq 'del(.workstreams[0].tasks[0].agent_tone)' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "an agent chip without a declared tone was accepted"
+
+  write_valid_payload "$data"
+  jq '.workstreams[0].tasks[2].pr_url = "javascript:alert(1)"' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a non-HTTPS task PR URL was accepted"
+
+  write_valid_payload "$data"
+  jq '.workstreams[0].more_tasks = -1' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a negative omitted-task count was accepted"
+
+  write_valid_payload "$data"
+  jq '.workstreams[0].counts.active = -2' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a negative lane count was accepted"
+
+  write_valid_payload "$data"
+  jq '.workstreams[0].counts.sailing = 2' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a lane count keyed by an unknown state was accepted"
+
+  # The progress bar reads counts, so a capped lane cannot ship without them,
+  # and the object it does ship cannot be partial or smaller than its own rows.
+  write_valid_payload "$data"
+  jq 'del(.workstreams[0].counts)' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a capped lane without lane counts was accepted"
+
+  write_valid_payload "$data"
+  jq '.workstreams[0].counts = {}' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "an empty lane-counts object was accepted"
+
+  write_valid_payload "$data"
+  jq 'del(.workstreams[0].counts.held)' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a partial lane-counts object was accepted"
+
+  write_valid_payload "$data"
+  jq '.workstreams[0].counts = { done: 1, review: 0, active: 0, held: 1, decision: 0, queued: 0 }' \
+    "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "lane counts totalling fewer than the lane's own rows were accepted"
+
+  write_valid_payload "$data"
+  jq 'del(.workstreams[0].more_tasks)' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "lane counts describing rows the lane no longer omits were accepted"
+
+  write_valid_payload "$data"
+  jq '.waiting[0].key = (reduce range(129) as $i (""; . + "x"))' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a 129-char waiting key was accepted"
+
+  write_valid_payload "$data"
+  jq '.waiting[0].options = [] | .waiting[0].allow_freeform = false' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "an unanswerable waiting item was accepted"
+
+  write_valid_payload "$data"
+  jq '.waiting[0].options[0].label = ""' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a waiting option with an empty label was accepted"
+
+  write_valid_payload "$data"
+  jq '.waiting[0].recommend_value = "absent"' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a recommendation outside the options was accepted"
+
+  write_valid_payload "$data"
+  jq '.waiting[0].close = "discard"' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "an unknown close mode was accepted"
+
+  write_valid_payload "$data"
+  jq '.divergence[0].note = ""' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a divergence row without a note was accepted"
+
+  write_valid_payload "$data"
+  jq 'del(.agents[0].tone)' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  set +e; out=$(run_board "$home" build "$data" 2>&1); rc=$?; set -e
+  [ "$rc" -ne 0 ] || fail "a roster agent without a tone was accepted"
+
+  assert_absent "$board" "a refused payload still produced a board"
+  pass "build refuses malformed payloads before touching the board"
+}
+
+test_build_injects_binds_then_arms() {
+  local home data board out sid
+  home=$(make_home build)
+  data="$home/payload.json"
+  board="$home/.lavish/workstreams.html"
+  write_valid_payload "$data"
+
+  out=$(run_board "$home" build "$data") || fail "a valid payload did not build"
+  assert_contains "$out" "board: $board" "build did not report the board path: $out"
+  assert_contains "$out" "served: $board" "build did not establish the Lavish session: $out"
+  assert_contains "$out" "bound: " "build did not report the answer binding: $out"
+  assert_contains "$out" "armed: " "the first build did not arm the board source: $out"
+  assert_present "$board" "build reported success without a board"
+  printf '%s' "$out" | awk '/^bound: /{b=NR} /^armed: /{a=NR} END{exit !(b && a && b < a)}' \
+    || fail "the answer binding did not precede arming: $out"
+
+  # Round-trip: the payload extracted from the built page is byte-for-byte the
+  # same JSON document, and the escaped </script> string can no longer
+  # terminate the data block.
+  extract_payload "$board" | jq -S . > "$home/extracted.json" \
+    || fail "the built board does not carry parseable payload JSON"
+  jq -S . "$data" > "$home/expected.json"
+  diff -u "$home/expected.json" "$home/extracted.json" >/dev/null \
+    || fail "the injected payload does not round-trip to the input document"
+  grep -qF '</script><b>' "$board" \
+    && fail "a payload string embedded a live closing script tag in the page"
+  grep -qxF '__FM_WORKSTREAM_BOARD_DATA__' "$board" \
+    && fail "the data slot survived injection"
+
+  sid=$(run_lavish_source_id "$home" "$board")
+  assert_contains "$out" "bound: $sid" "the binding does not name the board source: $out"
+  [ "$(run_decisions "$home" binding "$sid")" = "(any)" ] \
+    || fail "the board source is not bound any-origin"
+  run_procevent "$home" list | awk 'NR > 1 { print $1 }' | grep -Fxq "$sid" \
+    || fail "the board source is not registered after build"
+  pass "build injects the payload, binds any-origin, then arms the source"
+}
+
+test_build_does_not_bind_or_arm_when_session_start_fails() {
+  local home data rc sid
+  home=$(make_home serve-failure)
+  data="$home/payload.json"
+  write_valid_payload "$data"
+  cat > "$home/fakebin/lavish-axi" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$home/fakebin/lavish-axi"
+
+  set +e
+  run_board "$home" build "$data" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "build continued after Lavish session establishment failed"
+  sid=$(run_lavish_source_id "$home" "$home/.lavish/workstreams.html")
+  ! run_decisions "$home" binding "$sid" >/dev/null 2>&1 \
+    || fail "build bound the board before its Lavish session existed"
+  ! run_procevent "$home" list | awk 'NR > 1 { print $1 }' | grep -Fxq "$sid" \
+    || fail "build armed the board before its Lavish session existed"
+  pass "build establishes the Lavish session before binding and arming"
+}
+
+test_rebuild_is_idempotent_and_does_not_double_arm() {
+  local home data board out records
+  home=$(make_home rearm)
+  data="$home/payload.json"
+  board="$home/.lavish/workstreams.html"
+  write_valid_payload "$data"
+  run_board "$home" build "$data" >/dev/null || fail "the first build failed"
+
+  jq '.generated = "2026-09-01T01:00Z"' "$data" > "$data.tmp" && mv "$data.tmp" "$data"
+  out=$(run_board "$home" build "$data") || fail "the rebuild failed"
+  assert_contains "$out" "already-armed: " "the rebuild re-armed an already registered source: $out"
+  extract_payload "$board" | jq -e '.generated == "2026-09-01T01:00Z"' >/dev/null \
+    || fail "the rebuild did not refresh the board payload in place"
+  records=$(find "$home/state/procevent" -name '*.source' | wc -l | tr -d ' ')
+  [ "$records" = 1 ] || fail "rebuilding left $records source registrations instead of 1"
+  pass "rebuild refreshes the board in place without double-arming"
+}
+
+test_build_refuses_a_template_without_exactly_one_slot() {
+  local home data rc out
+  home=$(make_home badslot)
+  data="$home/payload.json"
+  write_valid_payload "$data"
+  printf '<html><body>no slot</body></html>\n' > "$home/broken-template.html"
+  set +e
+  out=$(FM_WORKSTREAM_BOARD_TEMPLATE="$home/broken-template.html" run_board "$home" build "$data" 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "a template with no data slot was accepted"
+  assert_contains "$out" "data slot" "the slot refusal did not say why: $out"
+  assert_absent "$home/.lavish/workstreams.html" "a refused template still produced a board"
+  pass "build refuses a template without exactly one data slot"
+}
+
+test_path_is_stable_home_scoped_and_mockup_safe
+test_build_refuses_malformed_payloads_before_touching_the_board
+test_an_uncapped_lane_may_omit_its_counts
+test_the_composers_own_output_shape_builds
+test_lane_counts_must_total_the_whole_lane_exactly
+test_build_injects_binds_then_arms
+test_build_does_not_bind_or_arm_when_session_start_fails
+test_rebuild_is_idempotent_and_does_not_double_arm
+test_build_refuses_a_template_without_exactly_one_slot
